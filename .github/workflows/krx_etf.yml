@@ -1,17 +1,15 @@
-# 저장 위치: .github/workflows/krx_etf.yml
-# 필요한 Secrets (Settings > Secrets and variables > Actions):
-#   KRX_ID, KRX_PW, SMTP_USER, SMTP_PASS   (선택: MAIL_TO)
+# 필요한 Secrets: KRX_ID, KRX_PW, SMTP_USER, SMTP_PASS
 name: KRX other ETF list
 
 on:
   schedule:
     # GitHub cron은 UTC 기준. 21:20 UTC(일~목) = 06:20 KST(월~금)
     - cron: "20 21 * * 0-4"
-  workflow_dispatch:   # Actions 탭에서 수동 실행
+  workflow_dispatch:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +33,6 @@ jobs:
           OUT_DIR: output
         run: python krx_etf_all_ver2.0.py
 
-      # 결과 엑셀 보관 (Actions 실행 화면에서 다운로드, 30일 보관)
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -43,7 +40,6 @@ jobs:
           path: output/*.xlsx
           retention-days: 30
 
-      # 실패 시 로그인 화면 스크린샷/HTML 업로드 (원인 확인용)
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
