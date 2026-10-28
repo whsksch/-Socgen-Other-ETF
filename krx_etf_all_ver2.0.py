@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-KRX ETF '기타 ETF' 추출 스크립트 - [클라우드(GitHub Actions)용 ver2.0]
+KRX ETF '기타 ETF' 추출 스크립트 - [클라우드(GitHub Actions)용 ver2.1]
 
 흐름: KRX 로그인(ID/PW, 헤드리스) -> [13104] ETF 전종목 기본정보 조회 -> 기타 ETF 필터링/엑셀 생성 -> 메일 발송
 
   국내주식형 ETF = 기초시장분류 '국내' AND 기초자산분류 '주식' AND 추적배수 '일반'
   기타 ETF       = 위 조건에 해당하지 않는 모든 ETF
   출력 컬럼      = Code(단축코드 + ' KP') / ISIN(표준코드) / Name(영문종목명)
+
+ver2.0 -> ver2.1 변경점
+  - 브라우저 클릭 대신 로그인 요청을 직접 전송, 중복 로그인(CD011) 시 기존 세션 종료 후 로그인
+  - 직접 로그인이 안 되면 기존 브라우저 방식으로 1회 예비 시도
 
 ver1 -> ver2 변경점
   - 사람이 브라우저에서 로그인하던 방식 -> KRX 아이디/비밀번호로 자동 로그인 (매 실행마다 새로 로그인)
@@ -40,7 +44,7 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 
 # ============================== 설정 ==============================
-DEFAULT_TO = "youngwook0002.kim@samsung.com"
+DEFAULT_TO = "youngwook0002.kim@samsung.com,derivatives@samsung.com"
 PROVIDERS = {"gmail": ("smtp.gmail.com", 465), "naver": ("smtp.naver.com", 465)}
 
 OUT_DIR = Path(os.getenv("OUT_DIR") or "output").resolve()
@@ -185,22 +189,95 @@ def fetch_basic(ctx) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
-def get_etf_basic(headed: bool = False) -> pd.DataFrame:
+# ---------------------------------------------------------------- 1-A) 직접 로그인 (브라우저 없이, 기본 경로)
+# ver2.1: 화면 클릭 대신 KRX 로그인 요청을 직접 보낸다.
+#   - 응답의 _error_code 로 결과 판단: CD001=성공, CD011=다른 곳에 로그인된 세션 있음(중복 로그인)
+#   - CD011 이면 skipDup=Y 로 다시 보내 기존 세션을 끊고 로그인 (화면 방식에서는 이 확인창 때문에 로그인이 안 됐음)
+#   - 그 외 코드(비밀번호 오류 등)는 계정 잠김 방지를 위해 재시도하지 않고 종료
+LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+LOGIN_POST = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+WARMUP_URL = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
+
+
+class LoginRejected(Exception):
+    pass
+
+
+def http_login(user: str, pw: str):
+    import requests
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9"})
+    s.get(WARMUP_URL, timeout=60)          # JSESSIONID 발급
+    s.get(LOGIN_PAGE, timeout=60)
+    form = {"mbrNm": "", "telNo": "", "di": "", "certType": "", "mbrId": user, "pw": pw}
+    headers = {"Referer": LOGIN_PAGE, "X-Requested-With": "XMLHttpRequest"}
+
+    def post(extra=None):
+        r = s.post(LOGIN_POST, data={**form, **(extra or {})}, headers=headers, timeout=60)
+        try:
+            j = r.json()
+        except ValueError:
+            j = {}
+        code = str(j.get("_error_code", "")).strip()
+        msg = str(j.get("_error_message", "")).strip()
+        print(f"  [로그인] HTTP {r.status_code}, 결과코드 {code or '-'} {msg[:60]}")
+        return code, msg
+
+    code, msg = post()
+    if code == "CD011":
+        print("  [로그인] 다른 곳에 로그인된 세션이 있어 기존 세션을 종료하고 다시 로그인합니다.")
+        code, msg = post({"skipDup": "Y"})
+    if code not in ("CD001", ""):
+        raise LoginRejected(f"{code} {msg}")
+    return s
+
+
+def http_fetch(s) -> pd.DataFrame | None:
+    s.get(HOME_URL, timeout=60)
+    r = s.post(KRX_URL,
+               data={"bld": KRX_BLD, "locale": "ko_KR", "csvxls_isNo": "false"},
+               headers={"Referer": HOME_URL, "X-Requested-With": "XMLHttpRequest"},
+               timeout=90)
+    if r.status_code != 200:
+        print(f"  KRX 응답 status={r.status_code}: {r.text[:80]!r}")
+        return None
+    try:
+        rows = r.json().get("output", [])
+    except ValueError:
+        print(f"  JSON이 아닌 응답: {r.text[:80]!r}")
+        return None
+    return pd.DataFrame(rows) if rows else None
+
+
+# ---------------------------------------------------------------- 1-B) 브라우저 로그인 (예비 경로)
+def browser_get(user: str, pw: str, headed: bool) -> pd.DataFrame | None:
     from playwright.sync_api import sync_playwright
 
-    user, pw = env("KRX_ID"), env("KRX_PW")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed)
         ctx = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul")
         try:
             login(ctx, user, pw)
-            df = fetch_basic(ctx)
-            if df is None:   # 로그인 직후 세션 반영이 늦는 경우 대비 1회만 재시도
-                print("  1회 재로그인 후 재시도")
-                login(ctx, user, pw)
-                df = fetch_basic(ctx)
+            return fetch_basic(ctx)
         finally:
             browser.close()
+
+
+def get_etf_basic(headed: bool = False) -> pd.DataFrame:
+    user, pw = env("KRX_ID"), env("KRX_PW")
+    df = None
+    if not headed:
+        print("  [1차] 직접 로그인")
+        try:
+            df = http_fetch(http_login(user, pw))
+        except LoginRejected as e:
+            sys.exit(f"KRX 로그인이 거부되었습니다({e}). 아이디/비밀번호를 확인하세요. 계정 잠김 방지를 위해 재시도하지 않습니다.")
+        except Exception as e:  # noqa: BLE001  (네트워크 오류 등)
+            print(f"  직접 로그인 경로 오류: {str(e).splitlines()[0]}")
+    if df is None:
+        print("  [2차] 브라우저 로그인")
+        df = browser_get(user, pw, headed)
     if df is None:
         sys.exit("로그인 후에도 데이터를 받지 못했습니다. output/debug/ 파일을 확인하세요.")
     print(f"  ETF 전종목 기본정보 {len(df)}건 수신")
